@@ -6,11 +6,15 @@
 // pending_confirmation, ready for the re-permission send.
 //
 // Protected by ADMIN_PASSWORD. Idempotent — safe to re-run.
-// The data JSON is imported and bundled into the function at build time; it
-// is never served as a public static file.
+// The data JSON is bundled into the function at build time (not publicly
+// served).
+//
+// Uses bulk operations (batched SELECT / INSERT / UPDATE) to stay well within
+// Vercel function timeout limits even on Hobby plan — total runtime for 2,024
+// records should be a few seconds, not minutes.
 //
 // Trigger:
-//   curl -X POST https://theartyst.co.uk/api/admin/import-repermission-batch \
+//   curl -X POST https://<domain>/api/admin/import-repermission-batch \
 //     -H "x-admin-password: $ADMIN_PASSWORD" \
 //     -H "content-type: application/json" \
 //     -d '{"dry_run": true}'
@@ -20,9 +24,14 @@ import { createClient } from '@supabase/supabase-js';
 import { randomUUID } from 'crypto';
 import batch from './subscribers-batch-2026-04.json' with { type: 'json' };
 
-// Token validity window — 6 weeks from import gives recipients until mid-June
-// to confirm. Silent-removal cron on 1 June sweeps the rest.
+// Token validity window — 6 weeks. Silent-removal cron on 1 June sweeps the rest.
 const TOKEN_EXPIRY_DAYS = 42;
+
+// Chunk sizes — keep requests under Supabase REST API payload/URL limits
+const LOOKUP_CHUNK = 200;   // IN() clause chunk for SELECT
+const INSERT_CHUNK = 500;   // Bulk INSERT chunk
+const UPDATE_CHUNK = 50;    // Parallel UPDATEs per chunk
+const EVENT_CHUNK = 500;    // Bulk INSERT for audit events
 
 export default async function handler(req, res) {
   // ---- Method & auth ------------------------------------------------------
@@ -34,7 +43,6 @@ export default async function handler(req, res) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
-  // ---- Config -------------------------------------------------------------
   const body = req.body ?? {};
   const dryRun = body.dry_run === true;
 
@@ -43,110 +51,199 @@ export default async function handler(req, res) {
     process.env.SUPABASE_SERVICE_ROLE_KEY
   );
 
-  // ---- Counters -----------------------------------------------------------
-  const counts = {
-    total: batch.records.length,
-    inserted: 0,
-    re_permissioned: 0,
-    skipped_confirmed: 0,
-    skipped_unsubscribed: 0,
-    errors: 0,
-  };
-  const errors = [];
+  const records = batch.records;
+  const allEmails = records.map(r => r.email);
 
-  const expiresAt = new Date(
-    Date.now() + TOKEN_EXPIRY_DAYS * 86400000
-  ).toISOString();
+  try {
+    // ----------------------------------------------------------------------
+    // Step 1: Bulk lookup — find all existing subscribers among our batch
+    // ----------------------------------------------------------------------
+    const existingByEmail = new Map();
 
-  // ---- Process each record ------------------------------------------------
-  for (const record of batch.records) {
-    const { email, first_name, provenance } = record;
-
-    try {
-      const { data: existing, error: lookupErr } = await supabase
+    for (let i = 0; i < allEmails.length; i += LOOKUP_CHUNK) {
+      const chunk = allEmails.slice(i, i + LOOKUP_CHUNK);
+      const { data, error } = await supabase
         .from('subscribers')
-        .select('id, status')
-        .eq('email', email)
-        .maybeSingle();
-      if (lookupErr) throw new Error(`lookup: ${lookupErr.message}`);
+        .select('id, email, status')
+        .in('email', chunk);
 
-      if (existing?.status === 'confirmed') {
-        counts.skipped_confirmed++;
-        continue;
-      }
-      if (existing?.status === 'unsubscribed') {
-        counts.skipped_unsubscribed++;
-        continue;
-      }
-
-      if (dryRun) {
-        if (existing) counts.re_permissioned++;
-        else counts.inserted++;
-        continue;
-      }
-
-      const confirmToken = randomUUID();
-
-      if (existing) {
-        const { error: updateErr } = await supabase
-          .from('subscribers')
-          .update({
-            status: 'pending_confirmation',
-            confirm_token: confirmToken,
-            confirm_token_expires_at: expiresAt,
-            import_batch: batch.batch_id,
-            first_name: first_name ?? undefined,
-          })
-          .eq('id', existing.id);
-        if (updateErr) throw new Error(`update: ${updateErr.message}`);
-
-        await supabase.from('subscription_events').insert({
-          subscriber_id: existing.id,
-          event_type: 'imported',
-          metadata: { batch: batch.batch_id, reimport: true, provenance },
+      if (error) {
+        return res.status(500).json({
+          error: 'Lookup failed',
+          stage: 'lookup',
+          detail: error.message,
         });
-        counts.re_permissioned++;
-      } else {
-        const { data: created, error: insertErr } = await supabase
-          .from('subscribers')
-          .insert({
-            email,
-            first_name,
-            name: first_name ?? null,
-            status: 'pending_confirmation',
-            confirm_token: confirmToken,
-            confirm_token_expires_at: expiresAt,
-            source: batch.batch_id,
-            import_batch: batch.batch_id,
-            notify_email: true,
-            notify_whatsapp: false,
-          })
-          .select('id')
-          .single();
-        if (insertErr) throw new Error(`insert: ${insertErr.message}`);
-
-        if (created) {
-          await supabase.from('subscription_events').insert({
-            subscriber_id: created.id,
-            event_type: 'imported',
-            metadata: { batch: batch.batch_id, new_row: true, provenance },
-          });
-        }
-        counts.inserted++;
       }
-    } catch (e) {
-      counts.errors++;
-      errors.push({ email, detail: e.message });
+      for (const row of data ?? []) {
+        existingByEmail.set(row.email, row);
+      }
     }
-  }
 
-  return res.status(200).json({
-    success: counts.errors === 0,
-    dry_run: dryRun,
-    batch_id: batch.batch_id,
-    counts,
-    errors: errors.slice(0, 20),
-    errors_truncated: errors.length > 20,
-    total_errors: errors.length,
-  });
+    // ----------------------------------------------------------------------
+    // Step 2: Categorize each record in memory
+    // ----------------------------------------------------------------------
+    const toInsert = [];
+    const toRepermission = [];
+    let skippedConfirmed = 0;
+    let skippedUnsubscribed = 0;
+
+    for (const record of records) {
+      const existing = existingByEmail.get(record.email);
+      if (!existing) {
+        toInsert.push(record);
+      } else if (existing.status === 'confirmed') {
+        skippedConfirmed++;
+      } else if (existing.status === 'unsubscribed') {
+        skippedUnsubscribed++;
+      } else {
+        toRepermission.push({ ...record, _existingId: existing.id });
+      }
+    }
+
+    // ----------------------------------------------------------------------
+    // Step 3: Dry-run returns counts and stops
+    // ----------------------------------------------------------------------
+    if (dryRun) {
+      return res.status(200).json({
+        success: true,
+        dry_run: true,
+        batch_id: batch.batch_id,
+        counts: {
+          total: records.length,
+          inserted: toInsert.length,
+          re_permissioned: toRepermission.length,
+          skipped_confirmed: skippedConfirmed,
+          skipped_unsubscribed: skippedUnsubscribed,
+          errors: 0,
+        },
+        note: 'Dry run — no changes written.',
+      });
+    }
+
+    // ----------------------------------------------------------------------
+    // Step 4: Bulk INSERT new rows (chunked)
+    // ----------------------------------------------------------------------
+    const expiresAt = new Date(
+      Date.now() + TOKEN_EXPIRY_DAYS * 86400000
+    ).toISOString();
+
+    const insertRows = toInsert.map(r => ({
+      email: r.email,
+      first_name: r.first_name,
+      name: r.first_name ?? null,
+      status: 'pending_confirmation',
+      confirm_token: randomUUID(),
+      confirm_token_expires_at: expiresAt,
+      source: batch.batch_id,
+      import_batch: batch.batch_id,
+      notify_email: true,
+      notify_whatsapp: false,
+    }));
+
+    const insertedIds = [];
+    for (let i = 0; i < insertRows.length; i += INSERT_CHUNK) {
+      const chunk = insertRows.slice(i, i + INSERT_CHUNK);
+      const { data, error } = await supabase
+        .from('subscribers')
+        .insert(chunk)
+        .select('id, email');
+
+      if (error) {
+        return res.status(500).json({
+          error: 'Insert failed',
+          stage: 'insert',
+          chunk_index: i,
+          chunk_size: chunk.length,
+          detail: error.message,
+          partial_inserted: insertedIds.length,
+        });
+      }
+      for (const row of data ?? []) {
+        insertedIds.push({ id: row.id, email: row.email });
+      }
+    }
+
+    // ----------------------------------------------------------------------
+    // Step 5: UPDATE re-permissioned rows (parallel in chunks)
+    // ----------------------------------------------------------------------
+    const updatedIds = [];
+    const updateErrors = [];
+
+    for (let i = 0; i < toRepermission.length; i += UPDATE_CHUNK) {
+      const chunk = toRepermission.slice(i, i + UPDATE_CHUNK);
+      const results = await Promise.all(
+        chunk.map(async (r) => {
+          const { error } = await supabase
+            .from('subscribers')
+            .update({
+              status: 'pending_confirmation',
+              confirm_token: randomUUID(),
+              confirm_token_expires_at: expiresAt,
+              import_batch: batch.batch_id,
+              first_name: r.first_name ?? undefined,
+            })
+            .eq('id', r._existingId);
+          return { id: r._existingId, email: r.email, error };
+        })
+      );
+      for (const result of results) {
+        if (result.error) {
+          updateErrors.push({ email: result.email, detail: result.error.message });
+        } else {
+          updatedIds.push(result.id);
+        }
+      }
+    }
+
+    // ----------------------------------------------------------------------
+    // Step 6: Bulk INSERT audit events
+    // ----------------------------------------------------------------------
+    const events = [
+      ...insertedIds.map(r => ({
+        subscriber_id: r.id,
+        event_type: 'imported',
+        metadata: { batch: batch.batch_id, new_row: true },
+      })),
+      ...updatedIds.map(id => ({
+        subscriber_id: id,
+        event_type: 'imported',
+        metadata: { batch: batch.batch_id, reimport: true },
+      })),
+    ];
+
+    let eventsLogged = 0;
+    for (let i = 0; i < events.length; i += EVENT_CHUNK) {
+      const chunk = events.slice(i, i + EVENT_CHUNK);
+      const { error } = await supabase.from('subscription_events').insert(chunk);
+      if (error) {
+        console.error('Event log chunk failed:', error);
+      } else {
+        eventsLogged += chunk.length;
+      }
+    }
+
+    return res.status(200).json({
+      success: updateErrors.length === 0,
+      dry_run: false,
+      batch_id: batch.batch_id,
+      counts: {
+        total: records.length,
+        inserted: insertedIds.length,
+        re_permissioned: updatedIds.length,
+        skipped_confirmed: skippedConfirmed,
+        skipped_unsubscribed: skippedUnsubscribed,
+        errors: updateErrors.length,
+      },
+      events_logged: eventsLogged,
+      errors: updateErrors.slice(0, 20),
+      errors_truncated: updateErrors.length > 20,
+      total_errors: updateErrors.length,
+    });
+  } catch (e) {
+    console.error('Import handler exception:', e);
+    return res.status(500).json({
+      error: 'Server error',
+      detail: e.message,
+    });
+  }
 }
