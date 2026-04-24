@@ -2,7 +2,7 @@
 // api/admin/send-repermission.js
 // ----------------------------------------------------------------------------
 // Sends the re-permission email to subscribers in pending_confirmation status
-// who haven't yet received it. Protected by ADMIN_PASSWORD.
+// who haven't yet received it. Protected by ADMIN_PASSWORD. 
 //
 // Naturally idempotent: queries only rows that lack a 'repermission_sent'
 // audit event, so re-running the endpoint won't double-send.
