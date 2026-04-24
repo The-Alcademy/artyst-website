@@ -103,7 +103,7 @@ function renderHtml({ firstName, confirmUrl, unsubscribeUrl }) {
 
   <p style="margin:32px 0 0;font-size:13px;color:#6a6a6a;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
     <a href="${unsubscribeUrl}" style="color:#6a6a6a;text-decoration:underline;">Unsubscribe immediately</a> ·
-    <a href="https://theartyst.co.uk/privacy" style="color:#6a6a6a;text-decoration:underline;">Privacy policy</a>
+    <a href="${SITE}/privacy" style="color:#6a6a6a;text-decoration:underline;">Privacy policy</a>
   </p>
 </div>
 </body>
@@ -136,7 +136,7 @@ Director, OtherSyde Ltd / The Artyst
 ${REPLY_TO} · theartyst.co.uk
 
 Unsubscribe: ${unsubscribeUrl}
-Privacy policy: https://theartyst.co.uk/privacy
+Privacy policy: ${SITE}/privacy
 `;
 }
 
