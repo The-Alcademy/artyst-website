@@ -2,7 +2,7 @@
 // api/admin/send-repermission.js
 // ----------------------------------------------------------------------------
 // Sends the re-permission email to subscribers in pending_confirmation status
-// who haven't yet received it. Protected by ADMIN_PASSWORD. 
+// who haven't yet received it. Protected by ADMIN_PASSWORD.
 //
 // Naturally idempotent: queries only rows that lack a 'repermission_sent'
 // audit event, so re-running the endpoint won't double-send.
@@ -80,7 +80,7 @@ function renderHtml({ firstName, confirmUrl, unsubscribeUrl }) {
 <div style="max-width:560px;margin:0 auto;padding:32px 24px;">
   <p style="margin:0 0 16px;font-size:17px;">Hi ${name},</p>
 
-  <p style="margin:0 0 16px;font-size:17px;">This is Matthew Taylor from OtherSyde — we're now trading as The Artyst, Cambridge's Syd Barrett heritage venue on Chesterton Road. You're on our historical email list, possibly from the Alcademy days, possibly from a Syd Barrett event or tour, possibly from something else we crossed paths on.</p>
+  <p style="margin:0 0 16px;font-size:17px;">This is Matthew Taylor from OtherSyde — we're now trading as The Artyst, Cambridge's Syd Barrett heritage venue on Chesterton Road. You're on our historical email list, possibly from a Syd Barrett event or tour, possibly from something else we crossed paths on.</p>
 
   <p style="margin:0 0 16px;font-size:17px;">It's been a while for many of you, and rather than start sending broadly again without asking, I'm starting with a clean opt-in.</p>
 
@@ -115,7 +115,7 @@ function renderText({ firstName, confirmUrl, unsubscribeUrl }) {
   const name = firstName || 'there';
   return `Hi ${name},
 
-This is Matthew Taylor from OtherSyde — we're now trading as The Artyst, Cambridge's Syd Barrett heritage venue on Chesterton Road. You're on our historical email list, possibly from the Alcademy days, possibly from a Syd Barrett event or tour, possibly from something else we crossed paths on.
+This is Matthew Taylor from OtherSyde — we're now trading as The Artyst, Cambridge's Syd Barrett heritage venue on Chesterton Road. You're on our historical email list, possibly from a Syd Barrett event or tour, possibly from something else we crossed paths on.
 
 It's been a while for many of you, and rather than start sending broadly again without asking, I'm starting with a clean opt-in.
 
