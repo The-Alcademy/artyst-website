@@ -1,0 +1,10 @@
+{
+  "name": "artyst-website",
+  "version": "1.0.0",
+  "private": true,
+  "description": "The Artyst — theartyst.co.uk",
+  "type": "module",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0"
+  }
+}
