@@ -1,460 +1,362 @@
-<!DOCTYPE html>
-<html lang="en">
+// ============================================================================
+// api/admin/add-subscriber.js
+// ----------------------------------------------------------------------------
+// Admin endpoint to manually add a single subscriber. Powers the form at
+// /admin/subscribers. Protected by ADMIN_PASSWORD.
+//
+// Two modes:
+//   mode: "opt_in"    — insert as pending_confirmation, send welcome email
+//                       with confirm link (double opt-in, GDPR-safest).
+//   mode: "confirmed" — insert as confirmed directly. For in-venue walk-ins
+//                       who verbally consented. No email sent. Subscriber
+//                       becomes immediately active.
+//
+// Idempotency:
+//   - Already-confirmed email: no-op, returns existing row
+//   - Pending-confirmation email: updates with fresh token (if opt_in mode)
+//                                 or promotes to confirmed (if confirmed mode)
+//   - Previously-unsubscribed email: returns 409 conflict unless force=true
+//   - Previously-bounced email: returns 409 conflict unless force=true
+// ============================================================================
+
+import { createClient } from '@supabase/supabase-js';
+import { randomUUID } from 'crypto';
+
+const SITE = process.env.PUBLIC_SITE_URL || 'https://artyst-website.vercel.app';
+const RESEND_API = 'https://api.resend.com/emails';
+
+const FROM = 'Matthew Taylor <matthew@theartyst.co.uk>';
+const REPLY_TO = 'matthew@othersyde.co.uk';
+const UNSUB_MAILTO = 'mailto:privacy@othersyde.co.uk?subject=unsubscribe';
+const SUBJECT = 'Please confirm your subscription to The Artyst';
+
+const TOKEN_EXPIRY_DAYS = 42;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function escapeHtml(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+}
+
+// ---- Welcome email template (distinct from re-permission) -----------------
+function renderWelcomeHtml({ firstName, confirmUrl, unsubscribeUrl }) {
+  const name = firstName ? escapeHtml(firstName) : 'there';
+  return `<!DOCTYPE html>
+<html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="robots" content="noindex, nofollow">
-<title>Subscriber Admin · The Artyst</title>
-<style>
-  :root {
-    --ink: #1a1a1a;
-    --ink-soft: #4a4a4a;
-    --ink-faint: #6a6a6a;
-    --paper: #fafaf8;
-    --line: #e5e3dc;
-    --accent: #1d5c5c;
-    --accent-soft: #e8f2f1;
-    --success: #2e7d5b;
-    --success-soft: #e6f2ec;
-    --warning: #a0712a;
-    --warning-soft: #fbf0e0;
-    --error: #b0433a;
-    --error-soft: #fbe8e4;
-  }
-  * { box-sizing: border-box; }
-  html { font-size: 16px; -webkit-text-size-adjust: 100%; }
-  body {
-    margin: 0;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    line-height: 1.5;
-    color: var(--ink);
-    background: var(--paper);
-    -webkit-font-smoothing: antialiased;
-    min-height: 100vh;
-    padding: 2rem 1.25rem;
-  }
-  main {
-    max-width: 560px;
-    width: 100%;
-    margin: 0 auto;
-  }
-  header.page-head {
-    margin-bottom: 2rem;
-    padding-bottom: 1rem;
-    border-bottom: 1px solid var(--line);
-  }
-  header.page-head .eyebrow {
-    font-size: 0.75rem;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-    color: var(--accent);
-    font-weight: 600;
-    margin-bottom: 0.35rem;
-  }
-  header.page-head h1 {
-    font-family: "Charter", "Georgia", serif;
-    font-size: 1.75rem;
-    margin: 0;
-    font-weight: 700;
-    letter-spacing: -0.01em;
-  }
-  h2 {
-    font-family: "Charter", "Georgia", serif;
-    font-size: 1.25rem;
-    margin: 0 0 1rem;
-    font-weight: 700;
-  }
-  label {
-    display: block;
-    font-size: 0.875rem;
-    font-weight: 600;
-    color: var(--ink-soft);
-    margin-bottom: 0.35rem;
-  }
-  input[type="text"], input[type="email"], input[type="password"] {
-    width: 100%;
-    padding: 0.625rem 0.75rem;
-    font-size: 1rem;
-    font-family: inherit;
-    border: 1px solid var(--line);
-    border-radius: 4px;
-    background: #ffffff;
-    color: var(--ink);
-    margin-bottom: 1.25rem;
-    transition: border-color 0.15s;
-  }
-  input:focus {
-    outline: none;
-    border-color: var(--accent);
-    box-shadow: 0 0 0 3px var(--accent-soft);
-  }
-  .radio-group {
-    display: flex;
-    flex-direction: column;
-    gap: 0.5rem;
-    margin-bottom: 1.25rem;
-    background: #ffffff;
-    border: 1px solid var(--line);
-    border-radius: 4px;
-    padding: 0.75rem 1rem;
-  }
-  .radio-group label {
-    display: flex;
-    align-items: flex-start;
-    gap: 0.5rem;
-    font-weight: 400;
-    color: var(--ink);
-    margin-bottom: 0;
-    cursor: pointer;
-    font-size: 0.9375rem;
-  }
-  .radio-group .hint {
-    display: block;
-    font-size: 0.8125rem;
-    color: var(--ink-faint);
-    margin-top: 0.15rem;
-  }
-  .checkbox {
-    display: flex;
-    align-items: flex-start;
-    gap: 0.5rem;
-    font-weight: 400;
-    color: var(--ink);
-    margin-bottom: 1.5rem;
-    cursor: pointer;
-    font-size: 0.875rem;
-  }
-  button {
-    background: var(--accent);
-    color: #ffffff;
-    border: none;
-    padding: 0.75rem 1.5rem;
-    font-size: 1rem;
-    font-weight: 600;
-    font-family: inherit;
-    border-radius: 4px;
-    cursor: pointer;
-    transition: background 0.15s;
-  }
-  button:hover {
-    background: #164848;
-  }
-  button:disabled {
-    background: var(--ink-faint);
-    cursor: not-allowed;
-  }
-  .result {
-    margin-top: 1.5rem;
-    padding: 1rem 1.25rem;
-    border-radius: 4px;
-    font-size: 0.9375rem;
-    line-height: 1.5;
-  }
-  .result.success {
-    background: var(--success-soft);
-    border-left: 3px solid var(--success);
-    color: #16432f;
-  }
-  .result.warning {
-    background: var(--warning-soft);
-    border-left: 3px solid var(--warning);
-    color: #6a4a18;
-  }
-  .result.error {
-    background: var(--error-soft);
-    border-left: 3px solid var(--error);
-    color: #6a2620;
-  }
-  .result strong { font-weight: 700; }
-  .result .detail { margin-top: 0.5rem; font-size: 0.875rem; }
-  .result .subscriber-meta {
-    margin-top: 0.75rem;
-    padding-top: 0.75rem;
-    border-top: 1px solid rgba(0,0,0,0.08);
-    font-size: 0.8125rem;
-    color: var(--ink-soft);
-    font-family: "SF Mono", "Menlo", monospace;
-  }
-  .logout {
-    margin-top: 2rem;
-    padding-top: 1rem;
-    border-top: 1px solid var(--line);
-    font-size: 0.875rem;
-    color: var(--ink-faint);
-  }
-  .logout a {
-    color: var(--ink-faint);
-    text-decoration: underline;
-  }
-  footer {
-    margin-top: 3rem;
-    font-size: 0.8125rem;
-    color: var(--ink-faint);
-  }
-</style>
+<title>${SUBJECT}</title>
 </head>
-<body>
-<main>
-  <header class="page-head">
-    <div class="eyebrow">The Artyst · Admin</div>
-    <h1>Add subscriber</h1>
-  </header>
+<body style="margin:0;padding:0;background:#fafaf8;font-family:Georgia,'Iowan Old Style','Palatino Linotype',serif;color:#1a1a1a;line-height:1.6;-webkit-font-smoothing:antialiased;">
+<div style="max-width:560px;margin:0 auto;padding:32px 24px;">
+  <p style="margin:0 0 16px;font-size:17px;">Hi ${name},</p>
 
-  <!-- Auth prompt (shown when no password in session) -->
-  <section id="auth-panel">
-    <h2>Admin password</h2>
-    <form id="auth-form" onsubmit="event.preventDefault(); authenticate();">
-      <input type="password" id="password-input" placeholder="Enter admin password" autofocus required>
-      <button type="submit">Unlock</button>
-    </form>
-    <div id="auth-error" class="result error" hidden></div>
-  </section>
+  <p style="margin:0 0 16px;font-size:17px;">Thanks for joining The Artyst's email list. To confirm your subscription, please click the button below:</p>
 
-  <!-- Main admin form (shown after unlock) -->
-  <section id="admin-panel" hidden>
-    <form id="add-form" onsubmit="event.preventDefault(); addSubscriber();">
-      <label for="email-input">Email</label>
-      <input type="email" id="email-input" placeholder="name@example.com" autocomplete="off" required>
+  <p style="margin:24px 0 24px;">
+    <a href="${confirmUrl}" style="display:inline-block;background:#1d5c5c;color:#ffffff;padding:12px 24px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;font-size:16px;font-weight:600;text-decoration:none;border-radius:4px;">→ Confirm my subscription</a>
+  </p>
 
-      <label for="name-input">First name (optional)</label>
-      <input type="text" id="name-input" placeholder="Jane" autocomplete="off">
+  <p style="margin:0 0 16px;font-size:17px;">You'll receive around one email a fortnight — events at the venue, exhibitions, news from the Invysible College and our Cambridge walking tours. You can unsubscribe at any time using the link at the bottom of every email.</p>
 
-      <label>Mode</label>
-      <div class="radio-group">
-        <label>
-          <input type="radio" name="mode" value="opt_in" checked>
-          <div>
-            Send opt-in email
-            <span class="hint">They'll receive a welcome email with a confirm button. Won't go live until they click.</span>
-          </div>
-        </label>
-        <label>
-          <input type="radio" name="mode" value="confirmed">
-          <div>
-            Add as confirmed
-            <span class="hint">They've already consented (verbal, in-venue, or explicit request). Goes live immediately. No email sent.</span>
-          </div>
-        </label>
-      </div>
+  <p style="margin:0 0 16px;font-size:17px;">If you didn't ask to be added to our list, just ignore this email — you won't hear from us again.</p>
 
-      <label class="checkbox">
-        <input type="checkbox" id="force-checkbox">
-        <span>Override previous unsubscribe or bounce (only tick if you're sure)</span>
-      </label>
+  <hr style="border:none;border-top:1px solid #e5e3dc;margin:32px 0;">
 
-      <button type="submit" id="submit-btn">Submit</button>
-    </form>
+  <p style="margin:0 0 16px;font-size:15px;color:#4a4a4a;">The Artyst is a café, bar and cultural venue at 54–56 Chesterton Road, Cambridge — the only dedicated Syd Barrett heritage venue in the world, operating with the approval of the Barrett and Mick Rock estates.</p>
 
-    <div id="result" class="result" hidden></div>
+  <p style="margin:0 0 8px;font-size:17px;">Warmly,</p>
+  <p style="margin:0 0 4px;font-size:17px;"><strong>Matthew Taylor</strong></p>
+  <p style="margin:0 0 4px;font-size:15px;color:#4a4a4a;">Director, OtherSyde Ltd / The Artyst</p>
+  <p style="margin:0 0 32px;font-size:15px;color:#4a4a4a;"><a href="mailto:${REPLY_TO}" style="color:#1d5c5c;">${REPLY_TO}</a> · <a href="https://theartyst.co.uk" style="color:#1d5c5c;">theartyst.co.uk</a></p>
 
-    <p class="logout"><a href="#" onclick="event.preventDefault(); logout();">Lock admin</a></p>
-  </section>
-
-  <footer>
-    Adds go directly to the Supabase <code>subscribers</code> table. All events audited in <code>subscription_events</code>.<br>
-    Manual adds are tagged <code>source=manual_add</code> and <code>import_batch=manual_add</code> for later reporting.
-  </footer>
-</main>
-
-<script>
-  const API_ADD = '/api/admin/add-subscriber';
-  const SESSION_KEY = 'artyst_admin_pw';
-
-  function getPw() {
-    return sessionStorage.getItem(SESSION_KEY);
-  }
-
-  function savePw(pw) {
-    sessionStorage.setItem(SESSION_KEY, pw);
-  }
-
-  function clearPw() {
-    sessionStorage.removeItem(SESSION_KEY);
-  }
-
-  function showAdmin() {
-    document.getElementById('auth-panel').hidden = true;
-    document.getElementById('admin-panel').hidden = false;
-    document.getElementById('email-input').focus();
-  }
-
-  function showAuth() {
-    document.getElementById('admin-panel').hidden = true;
-    document.getElementById('auth-panel').hidden = false;
-    document.getElementById('password-input').focus();
-  }
-
-  function authenticate() {
-    const pw = document.getElementById('password-input').value.trim();
-    if (!pw) return;
-    savePw(pw);
-    document.getElementById('auth-error').hidden = true;
-    showAdmin();
-  }
-
-  function logout() {
-    clearPw();
-    document.getElementById('email-input').value = '';
-    document.getElementById('name-input').value = '';
-    document.getElementById('force-checkbox').checked = false;
-    document.getElementById('result').hidden = true;
-    showAuth();
-  }
-
-  async function addSubscriber() {
-    const pw = getPw();
-    if (!pw) return showAuth();
-
-    const email = document.getElementById('email-input').value.trim().toLowerCase();
-    const firstName = document.getElementById('name-input').value.trim();
-    const mode = document.querySelector('input[name="mode"]:checked').value;
-    const force = document.getElementById('force-checkbox').checked;
-
-    const submitBtn = document.getElementById('submit-btn');
-    const resultEl = document.getElementById('result');
-    submitBtn.disabled = true;
-    submitBtn.textContent = 'Working…';
-    resultEl.hidden = true;
-
-    try {
-      const response = await fetch(API_ADD, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'x-admin-password': pw,
-        },
-        body: JSON.stringify({
-          email,
-          first_name: firstName || null,
-          mode,
-          force,
-        }),
-      });
-
-      const data = await response.json();
-
-      if (response.status === 401) {
-        clearPw();
-        document.getElementById('auth-error').textContent = 'Wrong password. Try again.';
-        document.getElementById('auth-error').hidden = false;
-        showAuth();
-        return;
-      }
-
-      if (response.status === 409) {
-        // Conflict — previously unsubscribed/bounced
-        resultEl.className = 'result warning';
-        resultEl.innerHTML =
-          '<strong>Conflict</strong>' +
-          '<div class="detail">' + escapeHtml(data.message || 'Existing state conflicts with this action.') + '</div>' +
-          '<div class="subscriber-meta">' +
-            'Status: ' + escapeHtml(data.existing_status || '?') +
-            (data.unsubscribed_at ? ' · Unsubscribed: ' + escapeHtml(data.unsubscribed_at) : '') +
-            (data.bounced_at ? ' · Bounced: ' + escapeHtml(data.bounced_at) : '') +
-          '</div>';
-        resultEl.hidden = false;
-        return;
-      }
-
-      if (!response.ok) {
-        resultEl.className = 'result error';
-        resultEl.innerHTML =
-          '<strong>Error</strong>' +
-          '<div class="detail">' + escapeHtml(data.error || 'Unknown error') +
-          (data.detail ? ' — ' + escapeHtml(data.detail) : '') + '</div>';
-        resultEl.hidden = false;
-        return;
-      }
-
-      // Success
-      const s = data.subscriber || {};
-      let headline;
-      let detail = '';
-      let className = 'result success';
-
-      switch (data.action) {
-        case 'inserted_pending':
-          headline = 'Opt-in email sent';
-          detail = 'A welcome email with a confirm button has been sent to <strong>' + escapeHtml(s.email) + '</strong>. They won\'t be active on the list until they click.';
-          if (!data.email_sent) {
-            className = 'result warning';
-            headline = 'Added as pending, but email failed';
-            detail = 'The subscriber is in the list as pending_confirmation, but the welcome email didn\'t send. ' +
-                     (data.email_error ? 'Error: ' + escapeHtml(data.email_error) : '');
-          }
-          break;
-        case 'inserted_confirmed':
-          headline = 'Added as confirmed';
-          detail = '<strong>' + escapeHtml(s.email) + '</strong> is now active on the list. No email was sent.';
-          break;
-        case 'updated_pending':
-          headline = 'Fresh opt-in email sent';
-          detail = 'Existing row updated with new token. A welcome email has been sent to <strong>' + escapeHtml(s.email) + '</strong>.';
-          if (!data.email_sent) {
-            className = 'result warning';
-            headline = 'Updated, but email failed';
-            detail = 'Existing row set back to pending_confirmation with a fresh token, but the welcome email failed. ' +
-                     (data.email_error ? 'Error: ' + escapeHtml(data.email_error) : '');
-          }
-          break;
-        case 'promoted_to_confirmed':
-          headline = 'Promoted to confirmed';
-          detail = 'Previously pending — now active on the list. No email sent.';
-          break;
-        case 'already_confirmed':
-          headline = 'Already on the list';
-          className = 'result warning';
-          detail = '<strong>' + escapeHtml(s.email) + '</strong> is already confirmed. No changes made.';
-          break;
-        default:
-          headline = 'Done';
-          detail = escapeHtml(JSON.stringify(data));
-      }
-
-      resultEl.className = className;
-      resultEl.innerHTML =
-        '<strong>' + headline + '</strong>' +
-        '<div class="detail">' + detail + '</div>' +
-        '<div class="subscriber-meta">' +
-          'ID: ' + escapeHtml(s.id || '?') +
-          ' · Status: ' + escapeHtml(s.status || '?') +
-          (data.previous_status ? ' · Was: ' + escapeHtml(data.previous_status) : '') +
-        '</div>';
-      resultEl.hidden = false;
-
-      // Clear the form on success (not on warnings)
-      if (className === 'result success') {
-        document.getElementById('email-input').value = '';
-        document.getElementById('name-input').value = '';
-        document.getElementById('force-checkbox').checked = false;
-        document.getElementById('email-input').focus();
-      }
-
-    } catch (e) {
-      resultEl.className = 'result error';
-      resultEl.innerHTML =
-        '<strong>Network error</strong>' +
-        '<div class="detail">' + escapeHtml(e.message || 'Request failed') + '</div>';
-      resultEl.hidden = false;
-    } finally {
-      submitBtn.disabled = false;
-      submitBtn.textContent = 'Submit';
-    }
-  }
-
-  function escapeHtml(s) {
-    if (s == null) return '';
-    return String(s)
-      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;').replace(/'/g, '&#039;');
-  }
-
-  // On load: if we have a saved password, show admin panel directly
-  if (getPw()) {
-    showAdmin();
-  } else {
-    showAuth();
-  }
-</script>
+  <p style="margin:32px 0 0;font-size:13px;color:#6a6a6a;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+    <a href="${unsubscribeUrl}" style="color:#6a6a6a;text-decoration:underline;">Unsubscribe immediately</a> ·
+    <a href="${SITE}/privacy" style="color:#6a6a6a;text-decoration:underline;">Privacy policy</a>
+  </p>
+</div>
 </body>
-</html>
+</html>`;
+}
+
+function renderWelcomeText({ firstName, confirmUrl, unsubscribeUrl }) {
+  const name = firstName || 'there';
+  return `Hi ${name},
+
+Thanks for joining The Artyst's email list. To confirm your subscription, please click the link below:
+
+${confirmUrl}
+
+You'll receive around one email a fortnight — events at the venue, exhibitions, news from the Invysible College and our Cambridge walking tours. You can unsubscribe at any time using the link at the bottom of every email.
+
+If you didn't ask to be added to our list, just ignore this email — you won't hear from us again.
+
+---
+
+The Artyst is a café, bar and cultural venue at 54-56 Chesterton Road, Cambridge — the only dedicated Syd Barrett heritage venue in the world, operating with the approval of the Barrett and Mick Rock estates.
+
+Warmly,
+
+Matthew Taylor
+Director, OtherSyde Ltd / The Artyst
+${REPLY_TO} · theartyst.co.uk
+
+Unsubscribe: ${unsubscribeUrl}
+Privacy policy: ${SITE}/privacy
+`;
+}
+
+// ---- Resend send ----------------------------------------------------------
+async function sendWelcomeEmail({ email, firstName, confirmToken, unsubToken }) {
+  const confirmUrl = `${SITE}/api/subscribe/confirm?t=${confirmToken}`;
+  const unsubscribeUrl = `${SITE}/api/subscribe/unsubscribe?t=${unsubToken}`;
+
+  const body = {
+    from: FROM,
+    to: [email],
+    reply_to: REPLY_TO,
+    subject: SUBJECT,
+    html: renderWelcomeHtml({ firstName, confirmUrl, unsubscribeUrl }),
+    text: renderWelcomeText({ firstName, confirmUrl, unsubscribeUrl }),
+    headers: {
+      'List-Unsubscribe': `<${unsubscribeUrl}>, <${UNSUB_MAILTO}>`,
+      'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
+    },
+  };
+
+  const response = await fetch(RESEND_API, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+
+  const responseText = await response.text();
+  if (!response.ok) {
+    throw new Error(`Resend ${response.status}: ${responseText}`);
+  }
+  try { return JSON.parse(responseText); } catch { return { raw: responseText }; }
+}
+
+// ---- Main handler ---------------------------------------------------------
+export default async function handler(req, res) {
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+  const adminPassword = req.headers['x-admin-password'];
+  if (!adminPassword || adminPassword !== process.env.ADMIN_PASSWORD) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const body = req.body ?? {};
+  const email = String(body.email ?? '').trim().toLowerCase();
+  const firstName = body.first_name ? String(body.first_name).trim() : null;
+  const mode = body.mode;
+  const force = body.force === true;
+
+  if (!EMAIL_RE.test(email)) {
+    return res.status(400).json({ error: 'Invalid email address' });
+  }
+  if (mode !== 'opt_in' && mode !== 'confirmed') {
+    return res.status(400).json({ error: 'Mode must be "opt_in" or "confirmed"' });
+  }
+  if (mode === 'opt_in' && !process.env.RESEND_API_KEY) {
+    return res.status(500).json({ error: 'RESEND_API_KEY not configured' });
+  }
+
+  const supabase = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_SERVICE_ROLE_KEY
+  );
+
+  try {
+    // Look up existing
+    const { data: existing, error: lookupErr } = await supabase
+      .from('subscribers')
+      .select('id, email, status, first_name, unsubscribed_at, bounced_at, confirmed_at')
+      .eq('email', email)
+      .maybeSingle();
+
+    if (lookupErr) {
+      return res.status(500).json({ error: 'Lookup failed', detail: lookupErr.message });
+    }
+
+    // ------------------------------------------------------------------
+    // Existing: already confirmed → no-op
+    // ------------------------------------------------------------------
+    if (existing?.status === 'confirmed') {
+      return res.status(200).json({
+        success: true,
+        action: 'already_confirmed',
+        subscriber: {
+          id: existing.id,
+          email: existing.email,
+          first_name: existing.first_name,
+          status: existing.status,
+          confirmed_at: existing.confirmed_at,
+        },
+        note: 'This email is already confirmed on the list. No changes made.',
+      });
+    }
+
+    // ------------------------------------------------------------------
+    // Existing: unsubscribed or bounced → require explicit force
+    // ------------------------------------------------------------------
+    if ((existing?.status === 'unsubscribed' || existing?.status === 'bounced') && !force) {
+      return res.status(409).json({
+        success: false,
+        error: 'conflict',
+        existing_status: existing.status,
+        unsubscribed_at: existing.unsubscribed_at,
+        bounced_at: existing.bounced_at,
+        message: `This email previously ${
+          existing.status === 'unsubscribed' ? 'unsubscribed' : 'bounced'
+        }. Submit again with "Override previous state" ticked to proceed.`,
+      });
+    }
+
+    // ------------------------------------------------------------------
+    // Upsert path
+    // ------------------------------------------------------------------
+    const now = new Date().toISOString();
+    const confirmToken = mode === 'opt_in' ? randomUUID() : null;
+    const expiresAt = mode === 'opt_in'
+      ? new Date(Date.now() + TOKEN_EXPIRY_DAYS * 86400000).toISOString()
+      : null;
+
+    let subscriberId;
+    let action;
+    let unsubToken;
+
+    if (existing) {
+      // Update in place
+      const updates = {
+        status: mode === 'opt_in' ? 'pending_confirmation' : 'confirmed',
+        first_name: firstName ?? existing.first_name,
+        confirm_token: confirmToken,
+        confirm_token_expires_at: expiresAt,
+        confirmed_at: mode === 'confirmed' ? now : null,
+        unsubscribed_at: null,
+        bounced_at: null,
+      };
+      const { error: updateErr } = await supabase
+        .from('subscribers')
+        .update(updates)
+        .eq('id', existing.id);
+      if (updateErr) {
+        return res.status(500).json({ error: 'Update failed', detail: updateErr.message });
+      }
+
+      // Re-fetch to get unsubscribe_token (needed for email)
+      const { data: refreshed } = await supabase
+        .from('subscribers')
+        .select('id, unsubscribe_token')
+        .eq('id', existing.id)
+        .single();
+
+      subscriberId = existing.id;
+      unsubToken = refreshed?.unsubscribe_token;
+      action = mode === 'opt_in'
+        ? 'updated_pending'
+        : 'promoted_to_confirmed';
+    } else {
+      // Brand new row
+      const { data: created, error: insertErr } = await supabase
+        .from('subscribers')
+        .insert({
+          email,
+          first_name: firstName,
+          name: firstName,
+          status: mode === 'opt_in' ? 'pending_confirmation' : 'confirmed',
+          confirm_token: confirmToken,
+          confirm_token_expires_at: expiresAt,
+          confirmed_at: mode === 'confirmed' ? now : null,
+          source: 'manual_add',
+          import_batch: 'manual_add',
+          notify_email: true,
+          notify_whatsapp: false,
+        })
+        .select('id, unsubscribe_token')
+        .single();
+
+      if (insertErr) {
+        return res.status(500).json({ error: 'Insert failed', detail: insertErr.message });
+      }
+      subscriberId = created.id;
+      unsubToken = created.unsubscribe_token;
+      action = mode === 'opt_in' ? 'inserted_pending' : 'inserted_confirmed';
+    }
+
+    // ------------------------------------------------------------------
+    // Log events
+    // ------------------------------------------------------------------
+    const eventRows = [{
+      subscriber_id: subscriberId,
+      event_type: 'imported',
+      metadata: {
+        manual_add: true,
+        new_row: !existing,
+        previous_status: existing?.status ?? null,
+        override: force,
+      },
+    }];
+    if (mode === 'confirmed') {
+      eventRows.push({
+        subscriber_id: subscriberId,
+        event_type: 'confirmed',
+        metadata: { manual_add: true, manually_confirmed: true },
+      });
+    }
+    await supabase.from('subscription_events').insert(eventRows);
+
+    // ------------------------------------------------------------------
+    // Send welcome email if opt_in
+    // ------------------------------------------------------------------
+    let emailSent = false;
+    let emailError = null;
+    if (mode === 'opt_in') {
+      try {
+        const resp = await sendWelcomeEmail({
+          email,
+          firstName,
+          confirmToken,
+          unsubToken,
+        });
+        emailSent = true;
+        await supabase.from('subscription_events').insert({
+          subscriber_id: subscriberId,
+          event_type: 'repermission_sent',
+          metadata: {
+            manual_add: true,
+            welcome_email: true,
+            resend_id: resp?.id ?? null,
+          },
+        });
+      } catch (e) {
+        emailError = e.message;
+      }
+    }
+
+    return res.status(200).json({
+      success: true,
+      action,
+      subscriber: {
+        id: subscriberId,
+        email,
+        first_name: firstName ?? existing?.first_name ?? null,
+        status: mode === 'opt_in' ? 'pending_confirmation' : 'confirmed',
+      },
+      email_sent: emailSent,
+      email_error: emailError,
+      previous_status: existing?.status ?? null,
+    });
+  } catch (e) {
+    console.error('add-subscriber exception:', e);
+    return res.status(500).json({ error: 'Server error', detail: e.message });
+  }
+}
