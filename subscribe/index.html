@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Join the list · The Artyst</title>
+<meta name="description" content="Sign up to The Artyst's email list — events, exhibitions, news from the Invysible College and Cambridge tours.">
+<style>
+  :root {
+    --ink: #1a1a1a;
+    --ink-soft: #4a4a4a;
+    --ink-faint: #6a6a6a;
+    --paper: #fafaf8;
+    --line: #e5e3dc;
+    --accent: #1d5c5c;
+    --accent-soft: #e8f2f1;
+  }
+  * { box-sizing: border-box; }
+  html { font-size: 16px; -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    font-family: "Charter", "Georgia", "Iowan Old Style", "Palatino Linotype", serif;
+    line-height: 1.6;
+    color: var(--ink);
+    background: var(--paper);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 2rem 1.25rem;
+  }
+  main {
+    max-width: 480px;
+    width: 100%;
+  }
+  .eyebrow {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-size: 0.75rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--accent);
+    font-weight: 600;
+    margin-bottom: 0.5rem;
+  }
+  h1 {
+    font-size: 2rem;
+    line-height: 1.2;
+    margin: 0 0 1rem;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+  }
+  p.intro {
+    margin: 0 0 1.75rem;
+    font-size: 1.0625rem;
+    color: var(--ink-soft);
+  }
+  form {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+  }
+  label {
+    display: block;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-size: 0.875rem;
+    font-weight: 600;
+    color: var(--ink);
+    margin-bottom: 0.35rem;
+  }
+  label .optional {
+    font-weight: 400;
+    color: var(--ink-faint);
+    font-size: 0.8125rem;
+  }
+  input[type="email"], input[type="text"] {
+    width: 100%;
+    padding: 0.75rem 0.875rem;
+    font-size: 1rem;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    background: #ffffff;
+    color: var(--ink);
+    margin-bottom: 1.25rem;
+    transition: border-color 0.15s, box-shadow 0.15s;
+  }
+  input:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+  }
+  /* Honeypot — hidden from users, present for bots */
+  .hp {
+    position: absolute;
+    left: -9999px;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+  }
+  button {
+    background: var(--accent);
+    color: #ffffff;
+    border: none;
+    padding: 0.875rem 1.5rem;
+    font-size: 1rem;
+    font-weight: 600;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background 0.15s;
+    margin-top: 0.25rem;
+  }
+  button:hover {
+    background: #164848;
+  }
+  .small-print {
+    margin-top: 1.5rem;
+    padding-top: 1.25rem;
+    border-top: 1px solid var(--line);
+    font-size: 0.875rem;
+    color: var(--ink-faint);
+    line-height: 1.55;
+  }
+  .small-print a {
+    color: var(--ink-faint);
+    text-decoration: underline;
+  }
+  .small-print a:hover { color: var(--accent); }
+  .signoff {
+    margin-top: 2rem;
+    font-size: 0.875rem;
+    color: var(--ink-faint);
+    font-style: italic;
+  }
+  @media (max-width: 520px) {
+    h1 { font-size: 1.625rem; }
+    p.intro { font-size: 1rem; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <div class="eyebrow">The Artyst</div>
+  <h1>Join the list.</h1>
+
+  <p class="intro">Around one email a fortnight — events at the venue, exhibitions, news from the Invysible College and our Cambridge walking tours. You can unsubscribe at any time.</p>
+
+  <form method="POST" action="/api/subscribe/signup" autocomplete="on">
+    <label for="email">Email</label>
+    <input type="email" id="email" name="email" placeholder="name@example.com" required autocomplete="email">
+
+    <label for="first_name">First name <span class="optional">— optional</span></label>
+    <input type="text" id="first_name" name="first_name" placeholder="Jane" maxlength="50" autocomplete="given-name">
+
+    <!-- Honeypot field — humans don't fill this in, bots do. Hidden via CSS. -->
+    <div class="hp" aria-hidden="true">
+      <label for="website">Website</label>
+      <input type="text" id="website" name="website" tabindex="-1" autocomplete="off">
+    </div>
+
+    <button type="submit">Join the list</button>
+  </form>
+
+  <p class="small-print">
+    By submitting, you agree to receive emails from The Artyst at the address above. We'll send you a confirmation email — your subscription only goes live once you click the link inside it. We won't share your details with anyone. <a href="/privacy">Privacy policy</a>.
+  </p>
+
+  <p class="signoff">The Artyst · 54–56 Chesterton Road · Cambridge CB4 1EN</p>
+</main>
+</body>
+</html>
