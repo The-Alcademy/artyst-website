@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -108,6 +107,10 @@
   var reason = params.get('reason') || 'unknown';
 
   var messages = {
+    invalid_email: {
+      title: "That email address didn't look right.",
+      message: "Please check the address and try again. If you're sure it's correct, write to us and we'll add you manually."
+    },
     missing_token: {
       heading: "Link incomplete",
       body: "The link you followed is missing its token. This usually happens if the URL got split across lines in the email — try copying and pasting it in full."
